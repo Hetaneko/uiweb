@@ -30,6 +30,7 @@ from comfy_api import feature_flags
 import node_helpers
 from comfyui_version import __version__
 from app.frontend_management import FrontendManager
+from comfy_execution.progress import get_progress_state, NodeState
 from comfy_api.internal import _ComfyNodeInternal
 
 from app.user_manager import UserManager
@@ -652,12 +653,58 @@ class PromptServer():
             prompt_id = request.match_info.get("prompt_id", None)
             return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
 
-        @routes.get("/queue")
+        def get_job_progress_info(prompt_id):
+          registry = get_progress_state()
+          nodes = registry.nodes
+
+          # Get node order (replace with actual graph order if necessary)
+          node_ids = list(nodes.keys())
+
+          finished_count = 0
+          current_node_percent = 0
+          for node_id in node_ids:
+              state = nodes[node_id]
+              if state["state"] == NodeState.Pending:
+                  finished_count += 1
+              elif state["state"] == NodeState.Running:
+                  # Only one node should be running
+                  current_node_percent = (state["value"] / state["max"]) if state["max"] > 0 else 0
+
+          # Current node info (optional, for your API)
+          current_node_id = None
+          current_node_progress = None
+          for node_id in node_ids:
+              state = nodes[node_id]
+              if state["state"] == NodeState.Running:
+                  current_node_id = node_id
+                  current_node_progress = int(current_node_percent * 100)
+                  break
+
+          return {
+              "current_node_id": current_node_id,
+              "current_node_progress": current_node_progress,
+              "finished_count": finished_count,
+          }
+
+        @routes.get("/queue/{prompt_id}")
         async def get_queue(request):
+            prompt_id = request.match_info.get("prompt_id", None)
+            prmpthistory = web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
             queue_info = {}
             current_queue = self.prompt_queue.get_current_queue_volatile()
-            queue_info['queue_running'] = current_queue[0]
-            queue_info['queue_pending'] = current_queue[1]
+            try:
+                que_progress = get_job_progress_info(current_queue[0][0][1])
+                queue_info["prompt_id"] = current_queue[0][0][1]
+            except:
+                que_progress = {}
+            queue_info["queue_progress"] = que_progress
+            if prmpthistory.text == "{}":
+              quefinished = False
+            else:
+              quefinished = True
+            queue_info["queue_finished"] = quefinished
+            # queue_info['queue_running'] = current_queue[0]
+            # queue_info['queue_pending'] = current_queue[1]
             return web.json_response(queue_info)
 
         @routes.post("/prompt")
