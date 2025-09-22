@@ -177,7 +177,7 @@ class WebUIProgressHandler(ProgressHandler):
                 "real_node_id": self.registry.dynprompt.get_real_node_id(node_id),
             }
             for node_id, state in nodes.items()
-            if state["state"] != NodeState.Pending
+            # if state["state"] != NodeState.Pending
         }
 
         # Send a combined progress_state message with all node states
