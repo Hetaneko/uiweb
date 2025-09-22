@@ -664,7 +664,7 @@ class PromptServer():
           current_node_percent = 0
           for node_id in node_ids:
               state = nodes[node_id]
-              if state["state"] == NodeState.Pending:
+              if state["state"] == NodeState.Finished:
                   finished_count += 1
               elif state["state"] == NodeState.Running:
                   # Only one node should be running
