@@ -246,6 +246,12 @@ class ProgressRegistry:
         self.nodes: Dict[str, NodeProgressState] = {}
         self.handlers: Dict[str, ProgressHandler] = {}
 
+        all_node_ids = self.dynprompt.all_node_ids()
+        for node_id in all_node_ids:
+            self.nodes[node_id] = NodeProgressState(
+                state=NodeState.Pending, value=0, max=1
+            )
+
     def register_handler(self, handler: ProgressHandler) -> None:
         """Register a progress handler"""
         self.handlers[handler.name] = handler
