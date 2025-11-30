@@ -177,7 +177,7 @@ class WebUIProgressHandler(ProgressHandler):
                 "real_node_id": self.registry.dynprompt.get_real_node_id(node_id),
             }
             for node_id, state in nodes.items()
-            if state["state"] != NodeState.Pending
+            # if state["state"] != NodeState.Pending
         }
 
         # Send a combined progress_state message with all node states
@@ -245,6 +245,12 @@ class ProgressRegistry:
         self.dynprompt = dynprompt
         self.nodes: Dict[str, NodeProgressState] = {}
         self.handlers: Dict[str, ProgressHandler] = {}
+
+        all_node_ids = self.dynprompt.all_node_ids()
+        for node_id in all_node_ids:
+            self.nodes[node_id] = NodeProgressState(
+                state=NodeState.Pending, value=0, max=1
+            )
 
     def register_handler(self, handler: ProgressHandler) -> None:
         """Register a progress handler"""
