@@ -2,7 +2,6 @@ import os
 import sys
 import asyncio
 import traceback
-import time
 
 import nodes
 import folder_paths
@@ -30,13 +29,13 @@ import comfy.model_management
 from comfy_api import feature_flags
 import node_helpers
 from comfyui_version import __version__
-from app.frontend_management import FrontendManager, parse_version
+from app.frontend_management import FrontendManager
+from comfy_execution.progress import get_progress_state, NodeState
 from comfy_api.internal import _ComfyNodeInternal
 
 from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
 from app.custom_node_manager import CustomNodeManager
-from app.subgraph_manager import SubgraphManager
 from typing import Optional, Union
 from api_server.routes.internal.internal_routes import InternalRoutes
 from protocol import BinaryEventTypes
@@ -49,28 +48,6 @@ async def send_socket_catch_exception(function, message):
         await function(message)
     except (aiohttp.ClientError, aiohttp.ClientPayloadError, ConnectionResetError, BrokenPipeError, ConnectionError) as err:
         logging.warning("send error: {}".format(err))
-
-# Track deprecated paths that have been warned about to only warn once per file
-_deprecated_paths_warned = set()
-
-@web.middleware
-async def deprecation_warning(request: web.Request, handler):
-    """Middleware to warn about deprecated frontend API paths"""
-    path = request.path
-
-    if path.startswith("/scripts/ui") or path.startswith("/extensions/core/"):
-        # Only warn once per unique file path
-        if path not in _deprecated_paths_warned:
-            _deprecated_paths_warned.add(path)
-            logging.warning(
-                f"[DEPRECATION WARNING] Detected import of deprecated legacy API: {path}. "
-                f"This is likely caused by a custom node extension using outdated APIs. "
-                f"Please update your extensions or contact the extension author for an updated version."
-            )
-
-    response: web.Response = await handler(request)
-    return response
-
 
 @web.middleware
 async def compress_body(request: web.Request, handler):
@@ -164,22 +141,6 @@ def create_origin_only_middleware():
 
     return origin_only_middleware
 
-
-def create_block_external_middleware():
-    @web.middleware
-    async def block_external_middleware(request: web.Request, handler):
-        if request.method == "OPTIONS":
-            # Pre-flight request. Reply successfully:
-            response = web.Response()
-        else:
-            response = await handler(request)
-
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'self';"
-        return response
-
-    return block_external_middleware
-
-
 class PromptServer():
     def __init__(self, loop):
         PromptServer.instance = self
@@ -191,7 +152,6 @@ class PromptServer():
         self.user_manager = UserManager()
         self.model_file_manager = ModelFileManager()
         self.custom_node_manager = CustomNodeManager()
-        self.subgraph_manager = SubgraphManager()
         self.internal_routes = InternalRoutes(self)
         self.supports = ["custom_nodes_from_web"]
         self.prompt_queue = execution.PromptQueue(self)
@@ -200,7 +160,7 @@ class PromptServer():
         self.client_session:Optional[aiohttp.ClientSession] = None
         self.number = 0
 
-        middlewares = [cache_control, deprecation_warning]
+        middlewares = [cache_control]
         if args.enable_compress_response_body:
             middlewares.append(compress_body)
 
@@ -208,9 +168,6 @@ class PromptServer():
             middlewares.append(create_cors_middleware(args.enable_cors_header))
         else:
             middlewares.append(create_origin_only_middleware())
-
-        if args.disable_api_nodes:
-            middlewares.append(create_block_external_middleware())
 
         max_upload_size = round(args.max_upload_size * 1024 * 1024)
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
@@ -594,8 +551,6 @@ class PromptServer():
             vram_total, torch_vram_total = comfy.model_management.get_total_memory(device, torch_total_too=True)
             vram_free, torch_vram_free = comfy.model_management.get_free_memory(device, torch_free_too=True)
             required_frontend_version = FrontendManager.get_required_frontend_version()
-            installed_templates_version = FrontendManager.get_installed_templates_version()
-            required_templates_version = FrontendManager.get_required_templates_version()
 
             system_stats = {
                 "system": {
@@ -604,8 +559,6 @@ class PromptServer():
                     "ram_free": ram_free,
                     "comfyui_version": __version__,
                     "required_frontend_version": required_frontend_version,
-                    "installed_templates_version": installed_templates_version,
-                    "required_templates_version": required_templates_version,
                     "python_version": sys.version,
                     "pytorch_version": comfy.model_management.torch_version,
                     "embedded_python": os.path.split(os.path.split(sys.executable)[0])[1] == "python_embeded",
@@ -693,27 +646,65 @@ class PromptServer():
             max_items = request.rel_url.query.get("max_items", None)
             if max_items is not None:
                 max_items = int(max_items)
-
-            offset = request.rel_url.query.get("offset", None)
-            if offset is not None:
-                offset = int(offset)
-            else:
-                offset = -1
-
-            return web.json_response(self.prompt_queue.get_history(max_items=max_items, offset=offset))
+            return web.json_response(self.prompt_queue.get_history(max_items=max_items))
 
         @routes.get("/history/{prompt_id}")
         async def get_history_prompt_id(request):
             prompt_id = request.match_info.get("prompt_id", None)
             return web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
 
-        @routes.get("/queue")
+        def get_job_progress_info(prompt_id):
+          registry = get_progress_state()
+          nodes = registry.nodes
+
+          # Get node order (replace with actual graph order if necessary)
+          node_ids = list(nodes.keys())
+
+          finished_count = 0
+          current_node_percent = 0
+          for node_id in node_ids:
+              state = nodes[node_id]
+              if state["state"] == NodeState.Pending:
+                  finished_count += 1
+              elif state["state"] == NodeState.Running:
+                  # Only one node should be running
+                  current_node_percent = (state["value"] / state["max"]) if state["max"] > 0 else 0
+
+          # Current node info (optional, for your API)
+          current_node_id = None
+          current_node_progress = None
+          for node_id in node_ids:
+              state = nodes[node_id]
+              if state["state"] == NodeState.Running:
+                  current_node_id = node_id
+                  current_node_progress = int(current_node_percent * 100)
+                  break
+
+          return {
+              "current_node_id": current_node_id,
+              "current_node_progress": current_node_progress,
+              "finished_count": finished_count,
+          }
+
+        @routes.get("/queue/{prompt_id}")
         async def get_queue(request):
+            prompt_id = request.match_info.get("prompt_id", None)
+            prmpthistory = web.json_response(self.prompt_queue.get_history(prompt_id=prompt_id))
             queue_info = {}
             current_queue = self.prompt_queue.get_current_queue_volatile()
-            remove_sensitive = lambda queue: [x[:5] for x in queue]
-            queue_info['queue_running'] = remove_sensitive(current_queue[0])
-            queue_info['queue_pending'] = remove_sensitive(current_queue[1])
+            try:
+                que_progress = get_job_progress_info(current_queue[0][0][1])
+                queue_info["prompt_id"] = current_queue[0][0][1]
+            except:
+                que_progress = {}
+            queue_info["queue_progress"] = que_progress
+            if prmpthistory.text == "{}":
+              quefinished = False
+            else:
+              quefinished = True
+            queue_info["queue_finished"] = quefinished
+            # queue_info['queue_running'] = current_queue[0]
+            # queue_info['queue_pending'] = current_queue[1]
             return web.json_response(queue_info)
 
         @routes.post("/prompt")
@@ -749,12 +740,7 @@ class PromptServer():
                     extra_data["client_id"] = json_data["client_id"]
                 if valid[0]:
                     outputs_to_execute = valid[2]
-                    sensitive = {}
-                    for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
-                        if sensitive_val in extra_data:
-                            sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-                    extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
-                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
                 else:
@@ -847,7 +833,6 @@ class PromptServer():
         self.user_manager.add_routes(self.routes)
         self.model_file_manager.add_routes(self.routes)
         self.custom_node_manager.add_routes(self.routes, self.app, nodes.LOADED_MODULE_DIRS.items())
-        self.subgraph_manager.add_routes(self.routes, nodes.LOADED_MODULE_DIRS.items())
         self.app.add_subapp('/internal', self.internal_routes.get_app())
 
         # Prefix every route with /api for easier matching for delegation.
@@ -868,31 +853,11 @@ class PromptServer():
         for name, dir in nodes.EXTENSION_WEB_DIRS.items():
             self.app.add_routes([web.static('/extensions/' + name, dir)])
 
-        installed_templates_version = FrontendManager.get_installed_templates_version()
-        use_legacy_templates = True
-        if installed_templates_version:
-            try:
-                use_legacy_templates = (
-                    parse_version(installed_templates_version)
-                    < parse_version("0.3.0")
-                )
-            except Exception as exc:
-                logging.warning(
-                    "Unable to parse templates version '%s': %s",
-                    installed_templates_version,
-                    exc,
-                )
-
-        if use_legacy_templates:
-            workflow_templates_path = FrontendManager.legacy_templates_path()
-            if workflow_templates_path:
-                self.app.add_routes([
-                    web.static('/templates', workflow_templates_path)
-                ])
-        else:
-            handler = FrontendManager.template_asset_handler()
-            if handler:
-                self.app.router.add_get("/templates/{path:.*}", handler)
+        workflow_templates_path = FrontendManager.templates_path()
+        if workflow_templates_path:
+            self.app.add_routes([
+                web.static('/templates', workflow_templates_path)
+            ])
 
         # Serve embedded documentation from the package
         embedded_docs_path = FrontendManager.embedded_docs_path()
